@@ -2,6 +2,12 @@
 
 A small, Git-backed foundation for structured information. It implements the design guide’s backend MVP as one Go binary with an embedded native Web Component UI and no runtime libraries.
 
+## Documentation
+
+- [Installation](INSTALLATION.md): native and Docker setup, verification, upgrades, and production boundaries.
+- [Source structure](SOURCE_STRUCTURE.md): package responsibilities, request flow, runtime data, and test layout.
+- [Specification adaptation](SPEC_ADAPTATION.md): design decisions, adversarial lessons, and remaining gaps.
+
 ## Run
 
 Requirements: Go 1.26+, Git, and Linux or macOS with local filesystem advisory locking.
@@ -96,8 +102,6 @@ Commit configuration changes before starting the server. Every API mutation crea
 - Git is authoritative. Reads use a bounded, immutable snapshot keyed by commit, so concurrent callers cannot observe partial state or drift.
 
 This is the deliberately small single-repository MVP. PostgreSQL projections, Git plumbing without a worktree, BlockSuite, WebSockets, extensions, permissions, branching, and distributed repositories are not included. Add them only when repository size, collaboration, or deployment requirements demonstrate the need.
-
-The reasoning, lessons from adversarial testing, and remaining gaps are documented in [SPEC_ADAPTATION.md](SPEC_ADAPTATION.md).
 
 The browser UI covers hierarchy browsing, search/filtering, schema-driven fields, CRUD, overlays, relationships, workflows, and history. It intentionally uses a safe text/JSON document editor rather than claiming full BlockSuite/WYSIWYG composition.
 
