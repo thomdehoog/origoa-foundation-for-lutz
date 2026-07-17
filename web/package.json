@@ -1,0 +1,15 @@
+{
+  "name": "origoa-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --format=esm --minify --outfile=dist/main.js && cp index.html dist/index.html"
+  },
+  "dependencies": {
+    "lit": "^3.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
