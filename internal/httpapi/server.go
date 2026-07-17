@@ -19,7 +19,10 @@ import (
 	"github.com/thomdehoog/origoa-foundation/internal/repository"
 )
 
-const maxBody = 1 << 20
+const (
+	maxBody               = 1 << 20
+	maxConcurrentRequests = 128
+)
 
 //go:embed web/*
 var assets embed.FS
@@ -27,10 +30,11 @@ var assets embed.FS
 type Server struct {
 	repository *repository.Repository
 	handler    http.Handler
+	slots      chan struct{}
 }
 
 func New(repo *repository.Repository) *Server {
-	server := &Server{repository: repo}
+	server := &Server{repository: repo, slots: make(chan struct{}, maxConcurrentRequests)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", server.health)
 	mux.HandleFunc("GET /api/artifacts", server.listArtifacts)
@@ -63,6 +67,18 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		response.Header().Set("X-Content-Type-Options", "nosniff")
 		response.Header().Set("X-Frame-Options", "DENY")
 		response.Header().Set("Permissions-Policy", "camera=(), geolocation=(), microphone=()")
+		select {
+		case s.slots <- struct{}{}:
+			defer func() { <-s.slots }()
+		case <-request.Context().Done():
+			return
+		default:
+			response.Header().Set("Retry-After", "1")
+			writeJSON(response, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{
+				"code": "server_busy", "message": "Server is busy; retry shortly.",
+			}})
+			return
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				slog.Error("request panic", "error", recovered)
@@ -120,6 +136,7 @@ func decodeJSON(response http.ResponseWriter, request *http.Request, destination
 	}
 	request.Body = http.MaxBytesReader(response, request.Body, maxBody)
 	decoder := json.NewDecoder(request.Body)
+	decoder.UseNumber()
 	if strict {
 		decoder.DisallowUnknownFields()
 	}

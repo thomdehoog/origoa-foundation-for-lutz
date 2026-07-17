@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func testRepository(t *testing.T) (*Repository, context.Context) {
+func testRepository(t testing.TB) (*Repository, context.Context) {
 	t.Helper()
 	ctx := context.Background()
 	repo, err := Open(ctx, t.TempDir())
@@ -344,6 +344,39 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func BenchmarkList25Artifacts(b *testing.B) {
+	repo, ctx := testRepository(b)
+	for range 25 {
+		if _, err := repo.Create(ctx, CreateInput{Kind: Entry, Type: "note", Title: "Artifact"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for range b.N {
+		if _, err := repo.List(Filters{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkGetFrom25Artifacts(b *testing.B) {
+	repo, ctx := testRepository(b)
+	var target StoredArtifact
+	for range 25 {
+		var err error
+		target, err = repo.Create(ctx, CreateInput{Kind: Entry, Type: "note", Title: "Artifact"})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for range b.N {
+		if _, err := repo.Get(target.Artifact.GUID); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func newTestGUID() string {

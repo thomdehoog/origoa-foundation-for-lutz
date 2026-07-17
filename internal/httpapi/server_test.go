@@ -154,6 +154,19 @@ func TestHTTPRejectsMalformedAndHostileRequests(t *testing.T) {
 	}
 }
 
+func TestRequestDecoderPreservesLargeIntegers(t *testing.T) {
+	request := httptest.NewRequest("POST", "/api/artifacts", strings.NewReader(`{"value":9007199254740993}`))
+	request.Header.Set("Content-Type", "application/json")
+	var destination map[string]any
+	if err := decodeJSON(httptest.NewRecorder(), request, &destination, true); err != nil {
+		t.Fatal(err)
+	}
+	value, ok := destination["value"].(json.Number)
+	if !ok || value.String() != "9007199254740993" {
+		t.Fatalf("large integer was changed: %T(%v)", destination["value"], destination["value"])
+	}
+}
+
 func TestConcurrentUpdatesAllowOneWinner(t *testing.T) {
 	server := testServer(t)
 	response, created := call(t, server, "POST", "/api/artifacts", `{"kind":"entry","type":"note","title":"original"}`, "application/json", "")
@@ -187,4 +200,61 @@ func TestConcurrentUpdatesAllowOneWinner(t *testing.T) {
 	if counts[200] != 1 || counts[412] != 1 {
 		t.Fatalf("concurrent outcomes: %#v", counts)
 	}
+}
+
+func TestMiddlewareRejectsExcessWork(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := &Server{slots: make(chan struct{}, 1)}
+	handler := server.middleware(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		response.WriteHeader(http.StatusNoContent)
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/slow", nil))
+	}()
+	<-entered
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest("GET", "/slow", nil))
+	if recorder.Code != http.StatusServiceUnavailable || recorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("overload response was %d with Retry-After %q", recorder.Code, recorder.Header().Get("Retry-After"))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil || errorCode(body) != "server_busy" {
+		t.Fatalf("invalid overload response: %q", recorder.Body.String())
+	}
+
+	close(release)
+	<-done
+}
+
+func FuzzExpectedETag(f *testing.F) {
+	for _, seed := range []string{"", "bare", `W/"weak"`, `"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"one", "two"`} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, header string) {
+		request := httptest.NewRequest("PUT", "/api/artifacts/id", nil)
+		request.Header.Set("If-Match", header)
+		value, err := expectedETag(request)
+		if err == nil && (value == "" || strings.TrimSpace(header) != `"`+value+`"`) {
+			t.Fatalf("invalid ETag accepted: %q -> %q", header, value)
+		}
+	})
+}
+
+func FuzzRequestDecoder(f *testing.F) {
+	f.Add([]byte(`{}`), "application/json")
+	f.Add([]byte(`{} {}`), "application/json")
+	f.Add([]byte(`{}`), "text/plain")
+	f.Fuzz(func(t *testing.T, body []byte, contentType string) {
+		request := httptest.NewRequest("POST", "/api/artifacts", bytes.NewReader(body))
+		request.Header.Set("Content-Type", contentType)
+		var destination map[string]any
+		_ = decodeJSON(httptest.NewRecorder(), request, &destination, true)
+	})
 }

@@ -4,7 +4,7 @@ A small, Git-backed foundation for structured information. It implements the des
 
 ## Run
 
-Requirements: Go 1.26+ and Git.
+Requirements: Go 1.26+, Git, and Linux or macOS with local filesystem advisory locking.
 
 ```sh
 go run ./cmd/origoa
@@ -92,10 +92,12 @@ Commit configuration changes before starting the server. Every API mutation crea
 - Permanent server-generated GUIDs and GUID-only references.
 - Lexically inherited schemas and workflows.
 - Entry, document, link, and comment persistence; overlays; search; history; relationship and workflow views.
-- Serialized writes, atomic file replacement, optimistic concurrency, strict request limits, path containment, reference integrity, security headers, and non-root container execution.
-- Git is authoritative. Search and hierarchy are rebuilt on demand, so no projection database can drift.
+- Cross-process serialized writes, atomic file replacement, optimistic concurrency, strict request limits, path containment, reference integrity, security headers, and non-root container execution.
+- Git is authoritative. Reads use a bounded, immutable snapshot keyed by commit, so concurrent callers cannot observe partial state or drift.
 
 This is the deliberately small single-repository MVP. PostgreSQL projections, Git plumbing without a worktree, BlockSuite, WebSockets, extensions, permissions, branching, and distributed repositories are not included. Add them only when repository size, collaboration, or deployment requirements demonstrate the need.
+
+The reasoning, lessons from adversarial testing, and remaining gaps are documented in [SPEC_ADAPTATION.md](SPEC_ADAPTATION.md).
 
 The browser UI covers hierarchy browsing, search/filtering, schema-driven fields, CRUD, overlays, relationships, workflows, and history. It intentionally uses a safe text/JSON document editor rather than claiming full BlockSuite/WYSIWYG composition.
 

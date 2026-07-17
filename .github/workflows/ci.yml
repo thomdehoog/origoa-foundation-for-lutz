@@ -8,19 +8,51 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: "1.26.x"
-          cache: true
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: go vet ./...
-      - run: node --check internal/httpapi/web/app.js
-      - run: go test -race ./...
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l .)"
+          test -z "$files" || { echo "$files"; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -shuffle=on ./...
+
+      - name: Stress concurrent paths
+        run: go test -race -cpu=1,4 -count=2 -run 'Test(Concurrent|ReadersNever|CachedResults|WriteLock)' ./internal/repository
+
+      - name: Fuzz repository boundaries
+        run: |
+          go test -run '^$' -fuzz '^FuzzSafeFolder$' -fuzztime=10s ./internal/repository
+          go test -run '^$' -fuzz '^FuzzStrictArtifactDecoder$' -fuzztime=10s ./internal/repository
+          go test -run '^$' -fuzz '^FuzzApplyPatch$' -fuzztime=10s ./internal/repository
+
+      - name: Fuzz HTTP boundaries
+        run: |
+          go test -run '^$' -fuzz '^FuzzExpectedETag$' -fuzztime=10s ./internal/httpapi
+          go test -run '^$' -fuzz '^FuzzRequestDecoder$' -fuzztime=10s ./internal/httpapi
+
+      - name: Check browser JavaScript
+        run: node --check internal/httpapi/web/app.js
+
+      - name: Build production binary
+        run: go build -trimpath -ldflags='-s -w' -o /tmp/origoa ./cmd/origoa
+
+      - name: Build container
+        run: docker build --tag origoa:ci .

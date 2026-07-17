@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -11,6 +12,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
+	"math"
+	"math/big"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,17 +26,25 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
 	uuidPattern       = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	hashPattern       = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 	identifierPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,63}$`)
 	hidPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	pathPartPattern   = regexp.MustCompile(`^[\pL\pN][\pL\pN._ -]{0,63}$`)
 )
 
-const maxContentLength = 500_000
+const (
+	maxContentLength  = 500_000
+	maxManagedFile    = 1 << 20
+	maxManagedFiles   = 100_000
+	maxManagedContent = 256 << 20
+	maxTreeListing    = 64 << 20
+)
 
 type Kind string
 
@@ -149,8 +161,23 @@ func fail(status int, code, message string) error {
 }
 
 type Repository struct {
-	root string
-	mu   sync.Mutex
+	root      string
+	gitDir    string
+	lockFile  string
+	cacheMu   sync.RWMutex
+	rebuildMu sync.Mutex
+	cache     *repositorySnapshot
+}
+
+type repositorySnapshot struct {
+	revision  string
+	artifacts map[string]StoredArtifact
+	files     map[string][]byte
+}
+
+type treeEntry struct {
+	name string
+	hash string
 }
 
 func Open(ctx context.Context, requestedRoot string) (*Repository, error) {
@@ -166,7 +193,30 @@ func Open(ctx context.Context, requestedRoot string) (*Repository, error) {
 		return nil, err
 	}
 	r := &Repository{root: root}
+	initializationLock := filepath.Join(root, ".origoa-initialize.lock")
+	unlock, err := lockFile(ctx, initializationLock)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if err := r.initialize(ctx); err != nil {
+		return nil, err
+	}
+	gitDir, err := r.git(ctx, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return nil, err
+	}
+	r.gitDir = gitDir
+	commonDir, err := r.git(ctx, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	commonDir = filepath.Clean(commonDir)
+	r.lockFile = filepath.Join(commonDir, "origoa.lock")
+	if err := excludeInitializationLock(commonDir); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -219,10 +269,15 @@ func (r *Repository) git(ctx context.Context, args ...string) (string, error) {
 }
 
 func (r *Repository) gitBytes(ctx context.Context, args ...string) ([]byte, error) {
+	return r.gitInputBytes(ctx, nil, args...)
+}
+
+func (r *Repository) gitInputBytes(ctx context.Context, input []byte, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", r.root}, args...)...)
 	command.Env = append(os.Environ(), "LC_ALL=C")
+	command.Stdin = bytes.NewReader(input)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(string(output)))
@@ -230,13 +285,131 @@ func (r *Repository) gitBytes(ctx context.Context, args ...string) ([]byte, erro
 	return output, nil
 }
 
+func (r *Repository) gitBytesLimited(ctx context.Context, limit int64, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", r.root}, args...)...)
+	command.Env = append(os.Environ(), "LC_ALL=C")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	output, readErr := io.ReadAll(io.LimitReader(stdout, limit+1))
+	if readErr != nil || int64(len(output)) > limit {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, fail(500, "repository_too_large", "Managed repository tree exceeds the size limit.")
+	}
+	if err := command.Wait(); err != nil {
+		return nil, fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
+	}
+	return output, nil
+}
+
 func (r *Repository) headFile(ctx context.Context, name string) ([]byte, bool, error) {
 	object := "HEAD:" + name
-	if _, err := r.gitBytes(ctx, "cat-file", "-e", object); err != nil {
+	output, err := r.gitInputBytes(ctx, []byte(object+"\n"), "cat-file", "--batch")
+	if err != nil {
+		return nil, false, err
+	}
+	reader := bufio.NewReader(bytes.NewReader(output))
+	header, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, false, fmt.Errorf("read git object header: %w", err)
+	}
+	if strings.HasSuffix(strings.TrimSpace(header), " missing") {
 		return nil, false, nil
 	}
-	raw, err := r.gitBytes(ctx, "show", object)
-	return raw, err == nil, err
+	fields := strings.Fields(header)
+	if len(fields) != 3 || fields[1] != "blob" {
+		return nil, false, errors.New("unexpected git object header")
+	}
+	size, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || size < 0 || size > maxManagedFile {
+		return nil, false, errors.New("git object exceeds managed file limit")
+	}
+	raw := make([]byte, size)
+	if _, err := io.ReadFull(reader, raw); err != nil {
+		return nil, false, fmt.Errorf("read git object: %w", err)
+	}
+	return raw, true, nil
+}
+
+func (r *Repository) lockWrite(ctx context.Context) (func(), error) {
+	return lockFile(ctx, r.lockFile)
+}
+
+func excludeInitializationLock(gitDir string) error {
+	name := filepath.Join(gitDir, "info", "exclude")
+	raw, err := os.ReadFile(name)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "/.origoa-initialize.lock" {
+			return nil
+		}
+	}
+	file, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+		_, err = file.WriteString("\n")
+	}
+	if err == nil {
+		_, err = file.WriteString("/.origoa-initialize.lock\n")
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func lockFile(ctx context.Context, name string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+				_ = file.Close()
+			}, nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = file.Close()
+			return nil, err
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			_ = file.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func kindValid(kind Kind) bool {
@@ -290,62 +463,254 @@ func marshal(value any) ([]byte, error) {
 	return append(raw, '\n'), nil
 }
 
+func marshalArtifact(artifact Artifact) ([]byte, error) {
+	raw, err := marshal(artifact)
+	if err == nil && len(raw) > maxManagedFile {
+		return nil, fail(413, "artifact_too_large", "Serialized artifact exceeds the size limit.")
+	}
+	return raw, err
+}
+
 func clone[T any](value T) (T, error) {
 	var result T
 	raw, err := json.Marshal(value)
 	if err == nil {
-		err = json.Unmarshal(raw, &result)
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		err = decoder.Decode(&result)
 	}
 	return result, err
 }
 
 func (r *Repository) scan() (map[string]StoredArtifact, error) {
-	found := make(map[string]StoredArtifact)
 	ctx := context.Background()
-	listing, err := r.gitBytes(ctx, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+	snapshot, err := r.snapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range bytes.Split(listing, []byte{0}) {
-		name := string(entry)
-		if name == "" || pathpkg.Base(name) != "artifact.json" || !uuidPattern.MatchString(pathpkg.Base(pathpkg.Dir(name))) {
+	return cloneArtifacts(snapshot.artifacts)
+}
+
+func (r *Repository) snapshot(ctx context.Context) (*repositorySnapshot, error) {
+	revision, err := r.currentRevision(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.cacheMu.RLock()
+	cached := r.cache
+	r.cacheMu.RUnlock()
+	if cached != nil && cached.revision == revision {
+		return cached, nil
+	}
+
+	r.rebuildMu.Lock()
+	defer r.rebuildMu.Unlock()
+	r.cacheMu.RLock()
+	cached = r.cache
+	r.cacheMu.RUnlock()
+	if cached != nil && cached.revision == revision {
+		return cached, nil
+	}
+
+	built, err := r.buildSnapshot(ctx, revision)
+	if err != nil {
+		return nil, err
+	}
+	r.cacheMu.Lock()
+	r.cache = built
+	r.cacheMu.Unlock()
+	return built, nil
+}
+
+func (r *Repository) currentRevision(ctx context.Context) (string, error) {
+	head, err := os.ReadFile(filepath.Join(r.gitDir, "HEAD"))
+	if err == nil {
+		value := strings.TrimSpace(string(head))
+		if hashPattern.MatchString(value) {
+			return value, nil
+		}
+		if strings.HasPrefix(value, "ref: refs/") {
+			name := strings.TrimPrefix(value, "ref: ")
+			clean := filepath.Clean(filepath.FromSlash(name))
+			if !filepath.IsAbs(clean) && clean != ".." && !strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+				if raw, readErr := os.ReadFile(filepath.Join(r.gitDir, clean)); readErr == nil {
+					revision := strings.TrimSpace(string(raw))
+					if hashPattern.MatchString(revision) {
+						return revision, nil
+					}
+				}
+			}
+		}
+	}
+	return r.git(ctx, "rev-parse", "HEAD")
+}
+
+func (r *Repository) buildSnapshot(ctx context.Context, revision string) (*repositorySnapshot, error) {
+	listing, err := r.gitBytesLimited(ctx, maxTreeListing, "ls-tree", "-r", "-z", revision)
+	if err != nil {
+		return nil, err
+	}
+	entries := []treeEntry{}
+	for _, rawEntry := range bytes.Split(listing, []byte{0}) {
+		parts := bytes.SplitN(rawEntry, []byte{'\t'}, 2)
+		if len(parts) != 2 {
 			continue
 		}
-		raw, err := r.gitBytes(ctx, "show", "HEAD:"+name)
-		if err != nil {
-			return nil, err
+		metadata := strings.Fields(string(parts[0]))
+		name := string(parts[1])
+		if len(metadata) != 3 || metadata[1] != "blob" || !managedFile(name) {
+			continue
 		}
+		if metadata[0] == "120000" {
+			return nil, fail(500, "repository_corrupt", "Managed file cannot be a symbolic link: "+name+".")
+		}
+		entries = append(entries, treeEntry{name: name, hash: metadata[2]})
+	}
+	if len(entries) > maxManagedFiles {
+		return nil, fail(500, "repository_too_large", "Repository contains too many managed files.")
+	}
+	blobs, err := r.readBlobs(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshot := &repositorySnapshot{revision: revision, artifacts: map[string]StoredArtifact{}, files: blobs}
+	for _, entry := range entries {
+		if !artifactFile(entry.name) {
+			continue
+		}
+		raw := blobs[entry.name]
 		var artifact Artifact
 		if err := decodeStrict(raw, &artifact); err != nil {
-			return nil, fail(500, "repository_corrupt", "Invalid artifact in "+name+": "+err.Error())
+			return nil, fail(500, "repository_corrupt", "Invalid artifact in "+entry.name+": "+err.Error())
 		}
 		if err := validateArtifact(artifact); err != nil {
-			return nil, fail(500, "repository_corrupt", "Invalid artifact in "+name+": "+err.Error())
+			return nil, fail(500, "repository_corrupt", "Invalid artifact in "+entry.name+": "+err.Error())
 		}
-		if !strings.EqualFold(pathpkg.Base(pathpkg.Dir(name)), artifact.GUID) {
+		if !strings.EqualFold(pathpkg.Base(pathpkg.Dir(entry.name)), artifact.GUID) {
 			return nil, fail(500, "repository_corrupt", "Artifact GUID does not match its directory.")
 		}
 		key := strings.ToLower(artifact.GUID)
-		if _, duplicate := found[key]; duplicate {
+		if _, duplicate := snapshot.artifacts[key]; duplicate {
 			return nil, fail(500, "repository_corrupt", "Duplicate artifact GUID "+artifact.GUID+".")
 		}
-		relativePath := pathpkg.Dir(pathpkg.Dir(name))
+		relativePath := pathpkg.Dir(pathpkg.Dir(entry.name))
 		if relativePath == "." {
 			relativePath = ""
 		}
-		found[key] = StoredArtifact{
+		if safePath, err := safeFolder(relativePath); err != nil || safePath != relativePath {
+			return nil, fail(500, "repository_corrupt", "Artifact is stored in an invalid folder: "+entry.name+".")
+		}
+		snapshot.artifacts[key] = StoredArtifact{
 			Artifact: artifact,
 			ETag:     checksum(raw),
 			Path:     relativePath,
-			file:     filepath.Join(r.root, filepath.FromSlash(name)),
+			file:     filepath.Join(r.root, filepath.FromSlash(entry.name)),
 			raw:      raw,
 		}
 	}
-	return found, nil
+	return snapshot, nil
+}
+
+func managedFile(name string) bool {
+	return artifactFile(name) || strings.Contains(name, "/.origoa/schemas/") || strings.HasPrefix(name, ".origoa/schemas/") ||
+		strings.Contains(name, "/.origoa/workflows/") || strings.HasPrefix(name, ".origoa/workflows/")
+}
+
+func artifactFile(name string) bool {
+	return pathpkg.Base(name) == "artifact.json" && uuidPattern.MatchString(pathpkg.Base(pathpkg.Dir(name)))
+}
+
+func (r *Repository) readBlobs(ctx context.Context, entries []treeEntry) (map[string][]byte, error) {
+	if len(entries) == 0 {
+		return map[string][]byte{}, nil
+	}
+	hashes := make([]string, 0, len(entries))
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if !seen[entry.hash] {
+			hashes = append(hashes, entry.hash)
+			seen[entry.hash] = true
+		}
+	}
+	input := []byte(strings.Join(hashes, "\n") + "\n")
+	checked, err := r.gitInputBytes(ctx, input, "cat-file", "--batch-check")
+	if err != nil {
+		return nil, err
+	}
+	total := int64(0)
+	for _, line := range strings.Split(strings.TrimSpace(string(checked)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[1] != "blob" {
+			return nil, fail(500, "repository_corrupt", "Managed Git object is not a blob.")
+		}
+		size, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil || size < 0 || size > maxManagedFile {
+			return nil, fail(500, "repository_too_large", "Managed file exceeds the size limit.")
+		}
+		total += size
+		if total > maxManagedContent {
+			return nil, fail(500, "repository_too_large", "Managed repository content exceeds the memory limit.")
+		}
+	}
+	batched, err := r.gitInputBytes(ctx, input, "cat-file", "--batch")
+	if err != nil {
+		return nil, err
+	}
+	reader := bufio.NewReader(bytes.NewReader(batched))
+	byHash := map[string][]byte{}
+	for range hashes {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read Git batch header: %w", err)
+		}
+		fields := strings.Fields(header)
+		if len(fields) != 3 || fields[1] != "blob" {
+			return nil, fail(500, "repository_corrupt", "Unexpected Git batch response.")
+		}
+		size, _ := strconv.Atoi(fields[2])
+		content := make([]byte, size)
+		if _, err := io.ReadFull(reader, content); err != nil {
+			return nil, fmt.Errorf("read Git blob: %w", err)
+		}
+		if separator, err := reader.ReadByte(); err != nil || separator != '\n' {
+			return nil, errors.New("invalid Git batch separator")
+		}
+		byHash[fields[0]] = content
+	}
+	files := make(map[string][]byte, len(entries))
+	for _, entry := range entries {
+		files[entry.name] = byHash[entry.hash]
+	}
+	return files, nil
+}
+
+func cloneArtifacts(source map[string]StoredArtifact) (map[string]StoredArtifact, error) {
+	result := make(map[string]StoredArtifact, len(source))
+	for key, item := range source {
+		cloned, err := cloneStored(item)
+		if err != nil {
+			return nil, err
+		}
+		cloned.raw = bytes.Clone(item.raw)
+		result[key] = cloned
+	}
+	return result, nil
+}
+
+func cloneStored(item StoredArtifact) (StoredArtifact, error) {
+	artifact, err := clone(item.Artifact)
+	if err != nil {
+		return StoredArtifact{}, err
+	}
+	item.Artifact = artifact
+	item.raw = nil
+	return item, nil
 }
 
 func decodeStrict(raw []byte, destination any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
@@ -453,14 +818,34 @@ func (r *Repository) get(guid string, all map[string]StoredArtifact) (StoredArti
 }
 
 func (r *Repository) Get(guid string) (StoredArtifact, error) {
-	all, err := r.scan()
+	snapshot, err := r.snapshot(context.Background())
 	if err != nil {
 		return StoredArtifact{}, err
 	}
-	return r.get(guid, all)
+	item, err := r.get(guid, snapshot.artifacts)
+	if err != nil {
+		return StoredArtifact{}, err
+	}
+	return cloneStored(item)
 }
 
 func (r *Repository) List(filters Filters) ([]StoredArtifact, error) {
+	items, err := r.filteredArtifacts(filters)
+	if err != nil {
+		return nil, err
+	}
+	for index, item := range items {
+		item, err = cloneStored(item)
+		if err != nil {
+			return nil, err
+		}
+		item.file, item.raw = "", nil
+		items[index] = item
+	}
+	return items, nil
+}
+
+func (r *Repository) filteredArtifacts(filters Filters) ([]StoredArtifact, error) {
 	if filters.Kind != "" && !kindValid(filters.Kind) {
 		return nil, fail(400, "invalid_kind", "Artifact kind is invalid.")
 	}
@@ -477,19 +862,18 @@ func (r *Repository) List(filters Filters) ([]StoredArtifact, error) {
 			return nil, err
 		}
 	}
-	all, err := r.scan()
+	snapshot, err := r.snapshot(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	result := make([]StoredArtifact, 0, len(all))
-	for _, item := range all {
+	result := make([]StoredArtifact, 0, len(snapshot.artifacts))
+	for _, item := range snapshot.artifacts {
 		if filters.Kind != "" && item.Artifact.Kind != filters.Kind || filters.Type != "" && item.Artifact.Type != filters.Type {
 			continue
 		}
 		if path != "" && item.Path != path && !strings.HasPrefix(item.Path, path+"/") {
 			continue
 		}
-		item.file, item.raw = "", nil
 		result = append(result, item)
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -513,8 +897,11 @@ func newGUID() (string, error) {
 }
 
 func (r *Repository) Create(ctx context.Context, input CreateInput) (StoredArtifact, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	unlock, err := r.lockWrite(ctx)
+	if err != nil {
+		return StoredArtifact{}, err
+	}
+	defer unlock()
 	folder, err := safeFolder(input.Path)
 	if err != nil {
 		return StoredArtifact{}, err
@@ -532,14 +919,15 @@ func (r *Repository) Create(ctx context.Context, input CreateInput) (StoredArtif
 	if err := validateArtifact(artifact); err != nil {
 		return StoredArtifact{}, err
 	}
-	all, err := r.scan()
+	snapshot, err := r.snapshot(ctx)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
-	if err := r.validateIntegrity(artifact, folder, all); err != nil {
+	all := snapshot.artifacts
+	if err := validateIntegrity(artifact, folder, all, snapshot.files); err != nil {
 		return StoredArtifact{}, err
 	}
-	raw, err := marshal(artifact)
+	raw, err := marshalArtifact(artifact)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
@@ -557,8 +945,11 @@ func (r *Repository) Create(ctx context.Context, input CreateInput) (StoredArtif
 		return StoredArtifact{}, err
 	}
 	if err := r.commit(ctx, file, commitMessage(artifact, "created")); err != nil {
+		if committed, verifyErr := r.headMatches(relative(r.root, file), raw); verifyErr == nil && committed {
+			return StoredArtifact{Artifact: artifact, ETag: checksum(raw), Path: folder}, nil
+		}
 		_ = os.RemoveAll(filepath.Dir(file))
-		_, _ = r.git(ctx, "reset", "--quiet", "HEAD", "--", relative(r.root, file))
+		_, _ = r.git(context.Background(), "reset", "--quiet", "HEAD", "--", relative(r.root, file))
 		return StoredArtifact{}, err
 	}
 	return StoredArtifact{Artifact: artifact, ETag: checksum(raw), Path: folder}, nil
@@ -610,18 +1001,43 @@ func writeExclusive(path string, raw []byte) error {
 }
 
 func writeAtomic(path string, raw []byte) error {
-	temporary := path + "." + strconv.FormatInt(time.Now().UnixNano(), 36) + ".tmp"
-	if err := writeExclusive(temporary, raw); err != nil {
+	temporaryFile, err := os.CreateTemp(filepath.Dir(path), ".origoa-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporary := temporaryFile.Name()
+	defer os.Remove(temporary)
+	if err := temporaryFile.Chmod(0o600); err == nil {
+		_, err = temporaryFile.Write(raw)
+	}
+	if err == nil {
+		err = temporaryFile.Sync()
+	}
+	if closeErr := temporaryFile.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return err
 	}
 	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
 		return err
 	}
 	return syncDirectory(filepath.Dir(path))
 }
 
-func syncDirectory(path string) error {
+func (r *Repository) headMatches(name string, expected []byte) (bool, error) {
+	raw, exists, err := r.headFile(context.Background(), name)
+	return exists && bytes.Equal(raw, expected), err
+}
+
+func restoreArtifactFile(name string, raw []byte) {
+	directory := filepath.Dir(name)
+	_ = os.MkdirAll(directory, 0o700)
+	_ = writeAtomic(name, raw)
+	_ = syncDirectory(filepath.Dir(directory))
+}
+
+var syncDirectory = func(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
 		return err
@@ -656,8 +1072,11 @@ var mutableProperties = map[string]bool{
 }
 
 func (r *Repository) Update(ctx context.Context, guid string, patch map[string]any, expectedETag string) (StoredArtifact, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	unlock, err := r.lockWrite(ctx)
+	if err != nil {
+		return StoredArtifact{}, err
+	}
+	defer unlock()
 	return r.updateLocked(ctx, guid, patch, expectedETag, "updated", false)
 }
 
@@ -670,10 +1089,11 @@ func (r *Repository) updateLocked(ctx context.Context, guid string, patch map[st
 	if err := validateJSON(patch, 0, new(int)); err != nil {
 		return StoredArtifact{}, err
 	}
-	all, err := r.scan()
+	snapshot, err := r.snapshot(ctx)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
+	all := maps.Clone(snapshot.artifacts)
 	current, err := r.get(guid, all)
 	if err != nil {
 		return StoredArtifact{}, err
@@ -692,10 +1112,10 @@ func (r *Repository) updateLocked(ctx context.Context, guid string, patch map[st
 		return StoredArtifact{}, err
 	}
 	delete(all, strings.ToLower(guid))
-	if err := r.validateIntegrity(artifact, current.Path, all); err != nil {
+	if err := validateIntegrity(artifact, current.Path, all, snapshot.files); err != nil {
 		return StoredArtifact{}, err
 	}
-	raw, err := marshal(artifact)
+	raw, err := marshalArtifact(artifact)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
@@ -712,11 +1132,15 @@ func (r *Repository) updateLocked(ctx context.Context, guid string, patch map[st
 		return StoredArtifact{}, err
 	}
 	if err := writeAtomic(current.file, raw); err != nil {
+		restoreArtifactFile(current.file, current.raw)
 		return StoredArtifact{}, err
 	}
 	if err := r.commit(ctx, current.file, commitMessage(artifact, operation)); err != nil {
-		_ = os.WriteFile(current.file, current.raw, 0o600)
-		_, _ = r.git(ctx, "reset", "--quiet", "HEAD", "--", relative(r.root, current.file))
+		if committed, verifyErr := r.headMatches(relative(r.root, current.file), raw); verifyErr == nil && committed {
+			return StoredArtifact{Artifact: artifact, ETag: checksum(raw), Path: current.Path}, nil
+		}
+		restoreArtifactFile(current.file, current.raw)
+		_, _ = r.git(context.Background(), "reset", "--quiet", "HEAD", "--", relative(r.root, current.file))
 		return StoredArtifact{}, err
 	}
 	return StoredArtifact{Artifact: artifact, ETag: checksum(raw), Path: current.Path}, nil
@@ -760,7 +1184,7 @@ func applyPatch(artifact *Artifact, patch map[string]any) error {
 				artifact.Fields = nil
 			} else {
 				var fields map[string]any
-				if json.Unmarshal(value, &fields) != nil {
+				if decodeNumber(value, &fields) != nil {
 					return fail(400, "invalid_value", "Fields are invalid.")
 				}
 				artifact.Fields = fields
@@ -768,7 +1192,7 @@ func applyPatch(artifact *Artifact, patch map[string]any) error {
 		case "content":
 			if remove {
 				artifact.Content = nil
-			} else if json.Unmarshal(value, &artifact.Content) != nil {
+			} else if decodeNumber(value, &artifact.Content) != nil {
 				return fail(400, "invalid_value", "Content is invalid.")
 			}
 		case "source":
@@ -826,13 +1250,29 @@ func applyPatch(artifact *Artifact, patch map[string]any) error {
 	return nil
 }
 
+func decodeNumber(raw []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("multiple JSON values")
+	}
+	return nil
+}
+
 func (r *Repository) Delete(ctx context.Context, guid, expectedETag string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	all, err := r.scan()
+	unlock, err := r.lockWrite(ctx)
 	if err != nil {
 		return err
 	}
+	defer unlock()
+	snapshot, err := r.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	all := snapshot.artifacts
 	current, err := r.get(guid, all)
 	if err != nil {
 		return err
@@ -851,11 +1291,15 @@ func (r *Repository) Delete(ctx context.Context, guid, expectedETag string) erro
 		if artifact.GUID == current.Artifact.GUID {
 			continue
 		}
-		schema, err := r.EffectiveSchema(artifact.Type, item.Path)
+		schema, err := effectiveSchema(snapshot.files, artifact.Type, item.Path)
 		if err != nil {
 			return err
 		}
-		for _, reference := range fieldReferences(resolvedFields(artifact, all), object(schema["fields"])) {
+		fields, err := resolvedFields(artifact, all)
+		if err != nil {
+			return err
+		}
+		for _, reference := range fieldReferences(fields, object(schema["fields"])) {
 			if strings.EqualFold(reference, current.Artifact.GUID) {
 				return fail(409, "artifact_referenced", "Artifact is still referenced.")
 			}
@@ -869,18 +1313,21 @@ func (r *Repository) Delete(ctx context.Context, guid, expectedETag string) erro
 		return err
 	}
 	if err := syncDirectory(filepath.Dir(directory)); err != nil {
+		restoreArtifactFile(current.file, current.raw)
 		return err
 	}
 	if err := r.commit(ctx, directory, commitMessage(current.Artifact, "deleted")); err != nil {
-		_ = os.MkdirAll(directory, 0o700)
-		_ = os.WriteFile(current.file, current.raw, 0o600)
-		_, _ = r.git(ctx, "reset", "--quiet", "HEAD", "--", relative(r.root, directory))
+		if _, exists, verifyErr := r.headFile(context.Background(), relative(r.root, current.file)); verifyErr == nil && !exists {
+			return nil
+		}
+		restoreArtifactFile(current.file, current.raw)
+		_, _ = r.git(context.Background(), "reset", "--quiet", "HEAD", "--", relative(r.root, directory))
 		return err
 	}
 	return nil
 }
 
-func (r *Repository) validateIntegrity(artifact Artifact, folder string, all map[string]StoredArtifact) error {
+func validateIntegrity(artifact Artifact, folder string, all map[string]StoredArtifact, files map[string][]byte) error {
 	if artifact.HID != "" {
 		for _, item := range all {
 			if strings.EqualFold(item.Artifact.HID, artifact.HID) {
@@ -917,12 +1364,15 @@ func (r *Repository) validateIntegrity(artifact Artifact, folder string, all map
 			}
 		}
 	}
-	schema, err := r.EffectiveSchema(artifact.Type, folder)
+	schema, err := effectiveSchema(files, artifact.Type, folder)
 	if err != nil {
 		return err
 	}
 	definitions := object(schema["fields"])
-	fields := resolvedFields(artifact, all)
+	fields, err := resolvedFields(artifact, all)
+	if err != nil {
+		return err
+	}
 	if err := validateFields(fields, definitions); err != nil {
 		return err
 	}
@@ -935,13 +1385,23 @@ func (r *Repository) validateIntegrity(artifact Artifact, folder string, all map
 		}
 	}
 	assigned := configuredWorkflows(schema)
-	for id, state := range artifact.Workflows {
+	for id := range artifact.Workflows {
 		if !assigned[id] {
 			return fail(400, "workflow_not_assigned", "Workflow '"+id+"' is not assigned by the schema.")
 		}
-		definition, err := r.readWorkflow(id, folder)
+	}
+	for id := range assigned {
+		definition, err := readWorkflow(files, id, folder)
 		if err != nil {
+			var repoError *Error
+			if errors.As(err, &repoError) && repoError.Code == "workflow_not_found" {
+				return fail(500, "repository_corrupt", "Schema assigns missing workflow '"+id+"'.")
+			}
 			return err
+		}
+		state := artifact.Workflows[id]
+		if state == "" {
+			state = definition.Initial
 		}
 		if !slices.Contains(definition.States, state) {
 			return fail(400, "invalid_workflow_state", "Workflow state is invalid.")
@@ -950,12 +1410,18 @@ func (r *Repository) validateIntegrity(artifact Artifact, folder string, all map
 	return nil
 }
 
-func resolvedFields(artifact Artifact, all map[string]StoredArtifact) map[string]any {
+func resolvedFields(artifact Artifact, all map[string]StoredArtifact) (map[string]any, error) {
 	chain := []Artifact{artifact}
+	seen := map[string]bool{strings.ToLower(artifact.GUID): true}
 	for cursor := artifact; cursor.Base != ""; {
-		base, ok := all[strings.ToLower(cursor.Base)]
+		key := strings.ToLower(cursor.Base)
+		if seen[key] || len(chain) > 32 {
+			return nil, fail(409, "overlay_cycle", "Overlay cycle detected.")
+		}
+		seen[key] = true
+		base, ok := all[key]
 		if !ok {
-			break
+			return nil, fail(409, "broken_reference", "Overlay base does not exist.")
 		}
 		chain = append([]Artifact{base.Artifact}, chain...)
 		cursor = base.Artifact
@@ -966,7 +1432,7 @@ func resolvedFields(artifact Artifact, all map[string]StoredArtifact) map[string
 			result[name], _ = clone(value)
 		}
 	}
-	return result
+	return result, nil
 }
 
 func configuredWorkflows(schema map[string]any) map[string]bool {
@@ -1025,6 +1491,14 @@ func merge(base, local map[string]any) map[string]any {
 }
 
 func (r *Repository) EffectiveSchema(artifactType, folder string) (map[string]any, error) {
+	snapshot, err := r.snapshot(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return effectiveSchema(snapshot.files, artifactType, folder)
+}
+
+func effectiveSchema(files map[string][]byte, artifactType, folder string) (map[string]any, error) {
 	if err := validateIdentifier(artifactType, "Artifact type"); err != nil {
 		return nil, err
 	}
@@ -1039,15 +1513,12 @@ func (r *Repository) EffectiveSchema(artifactType, folder string) (map[string]an
 	effective := map[string]any{"id": artifactType, "fields": map[string]any{}}
 	for index := 0; index <= len(parts); index++ {
 		name := pathpkg.Join(pathpkg.Join(parts[:index]...), ".origoa", "schemas", artifactType+".json")
-		raw, exists, err := r.headFile(context.Background(), name)
+		raw, exists := files[name]
 		if !exists {
 			continue
 		}
-		if err != nil {
-			return nil, err
-		}
 		var local map[string]any
-		if json.Unmarshal(raw, &local) != nil {
+		if decodeNumber(raw, &local) != nil {
 			return nil, fail(500, "repository_corrupt", "Invalid schema "+name+".")
 		}
 		if local["inheritance"] == "off" {
@@ -1055,7 +1526,96 @@ func (r *Repository) EffectiveSchema(artifactType, folder string) (map[string]an
 		}
 		effective = merge(effective, local)
 	}
+	if err := validateEffectiveSchema(effective); err != nil {
+		return nil, err
+	}
 	return effective, nil
+}
+
+var supportedFieldTypes = map[string]bool{
+	"text": true, "hid": true, "single-line": true, "multi-line": true, "rich-text": true,
+	"date": true, "time": true, "date-time": true, "boolean": true, "number": true,
+	"float": true, "currency": true, "integer": true, "enumeration": true,
+	"artifact-reference": true, "reference": true, "multi-artifact-reference": true,
+	"hyperlink": true, "json": true, "object": true, "attachment": true, "workflow": true,
+}
+
+func validateEffectiveSchema(schema map[string]any) error {
+	fields, ok := schema["fields"].(map[string]any)
+	if !ok {
+		return fail(500, "repository_corrupt", "Schema fields must be an object.")
+	}
+	for name, raw := range fields {
+		definition, ok := raw.(map[string]any)
+		if !ok {
+			return fail(500, "repository_corrupt", "Schema field '"+name+"' must be an object.")
+		}
+		fieldType := "text"
+		if rawType, exists := definition["type"]; exists {
+			var ok bool
+			fieldType, ok = rawType.(string)
+			if !ok || fieldType == "" {
+				return fail(500, "repository_corrupt", "Schema field '"+name+"' has an invalid type.")
+			}
+		}
+		if !supportedFieldTypes[fieldType] {
+			return fail(500, "repository_corrupt", "Schema field '"+name+"' has an unsupported type.")
+		}
+		if required, exists := definition["required"]; exists {
+			if _, ok := required.(bool); !ok {
+				return fail(500, "repository_corrupt", "Schema field '"+name+"' has invalid required metadata.")
+			}
+		}
+		if maximum, exists := definition["maxLength"]; exists {
+			value, ok := numberValue(maximum)
+			if !ok || value < 0 || value > maxManagedFile || math.Trunc(value) != value {
+				return fail(500, "repository_corrupt", "Schema field '"+name+"' has invalid maxLength metadata.")
+			}
+		}
+		if displayName, exists := definition["displayName"]; exists {
+			if _, ok := displayName.(string); !ok {
+				return fail(500, "repository_corrupt", "Schema field '"+name+"' has invalid display metadata.")
+			}
+		}
+		if multiplicity, exists := definition["multiplicity"]; exists {
+			value, ok := multiplicity.(string)
+			if !ok || value != "one" && value != "many" {
+				return fail(500, "repository_corrupt", "Schema field '"+name+"' has invalid multiplicity.")
+			}
+		}
+		if values, exists := definition["values"]; exists {
+			items, ok := values.([]any)
+			if !ok {
+				return fail(500, "repository_corrupt", "Schema field '"+name+"' has invalid enumeration values.")
+			}
+			seen := map[string]bool{}
+			for _, rawValue := range items {
+				value, ok := rawValue.(string)
+				if !ok || seen[value] {
+					return fail(500, "repository_corrupt", "Schema field '"+name+"' has invalid enumeration values.")
+				}
+				seen[value] = true
+			}
+			if fieldType == "enumeration" && len(items) == 0 {
+				return fail(500, "repository_corrupt", "Enumeration field '"+name+"' must define values.")
+			}
+		} else if fieldType == "enumeration" {
+			return fail(500, "repository_corrupt", "Enumeration field '"+name+"' must define values.")
+		}
+	}
+	if workflows, exists := schema["workflows"]; exists {
+		items, ok := workflows.([]any)
+		if !ok {
+			return fail(500, "repository_corrupt", "Schema workflows must be an array.")
+		}
+		for _, raw := range items {
+			id, ok := raw.(string)
+			if !ok || !identifierPattern.MatchString(id) {
+				return fail(500, "repository_corrupt", "Schema contains an invalid workflow assignment.")
+			}
+		}
+	}
+	return nil
 }
 
 func validateFields(fields, definitions map[string]any) error {
@@ -1103,7 +1663,7 @@ func validateFieldValue(name string, value any, definition map[string]any) error
 		if !ok {
 			return fail(400, "invalid_field", "Field '"+name+"' must be text.")
 		}
-		if maximum, ok := definition["maxLength"].(float64); ok && len(text) > int(maximum) {
+		if maximum, ok := numberValue(definition["maxLength"]); ok && len(text) > int(maximum) {
 			return fail(400, "invalid_field", "Field '"+name+"' is too long.")
 		}
 	}
@@ -1113,19 +1673,19 @@ func validateFieldValue(name string, value any, definition map[string]any) error
 		}
 	}
 	if slices.Contains([]string{"number", "float", "currency"}, fieldType) {
-		if _, ok := value.(float64); !ok {
+		if _, ok := numberValue(value); !ok {
 			return fail(400, "invalid_field", "Field '"+name+"' must be a number.")
 		}
 	}
 	if fieldType == "integer" {
-		number, ok := value.(float64)
-		if !ok || number != float64(int64(number)) {
+		if !integerValue(value) {
 			return fail(400, "invalid_field", "Field '"+name+"' must be an integer.")
 		}
 	}
 	if fieldType == "enumeration" {
 		values, _ := definition["values"].([]any)
-		if len(values) > 0 && !slices.ContainsFunc(values, func(allowed any) bool { return fmt.Sprint(allowed) == fmt.Sprint(value) }) {
+		selected, ok := value.(string)
+		if !ok || !slices.ContainsFunc(values, func(allowed any) bool { return allowed == selected }) {
 			return fail(400, "invalid_field", "Field '"+name+"' is not an allowed value.")
 		}
 	}
@@ -1150,11 +1710,64 @@ func validateFieldValue(name string, value any, definition map[string]any) error
 	return nil
 }
 
+func numberValue(value any) (float64, bool) {
+	switch number := value.(type) {
+	case json.Number:
+		parsed, err := number.Float64()
+		return parsed, err == nil && !math.IsInf(parsed, 0) && !math.IsNaN(parsed)
+	case float64:
+		return number, !math.IsInf(number, 0) && !math.IsNaN(number)
+	case float32:
+		return float64(number), !math.IsInf(float64(number), 0) && !math.IsNaN(float64(number))
+	case int:
+		return float64(number), true
+	case int8:
+		return float64(number), true
+	case int16:
+		return float64(number), true
+	case int32:
+		return float64(number), true
+	case int64:
+		return float64(number), true
+	case uint:
+		return float64(number), true
+	case uint8:
+		return float64(number), true
+	case uint16:
+		return float64(number), true
+	case uint32:
+		return float64(number), true
+	case uint64:
+		return float64(number), true
+	default:
+		return 0, false
+	}
+}
+
+func integerValue(value any) bool {
+	switch number := value.(type) {
+	case json.Number:
+		var exact big.Rat
+		_, ok := exact.SetString(number.String())
+		return ok && exact.IsInt()
+	case float64:
+		return !math.IsInf(number, 0) && !math.IsNaN(number) && math.Trunc(number) == number
+	case float32:
+		value := float64(number)
+		return !math.IsInf(value, 0) && !math.IsNaN(value) && math.Trunc(value) == value
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	default:
+		return false
+	}
+}
+
 func (r *Repository) ResolveOverlay(guid string) (Overlay, error) {
-	all, err := r.scan()
+	snapshot, err := r.snapshot(context.Background())
 	if err != nil {
 		return Overlay{}, err
 	}
+	all := snapshot.artifacts
 	top, err := r.get(guid, all)
 	if err != nil {
 		return Overlay{}, err
@@ -1208,12 +1821,20 @@ func (r *Repository) Links(guid string) (Links, error) {
 	if _, err := r.Get(guid); err != nil {
 		return Links{}, err
 	}
-	links, err := r.List(Filters{Kind: Link})
+	links, err := r.filteredArtifacts(Filters{Kind: Link})
 	if err != nil {
 		return Links{}, err
 	}
 	result := Links{Incoming: []StoredArtifact{}, Outgoing: []StoredArtifact{}}
 	for _, item := range links {
+		if !strings.EqualFold(item.Artifact.Target, guid) && !strings.EqualFold(item.Artifact.Source, guid) {
+			continue
+		}
+		item, err = cloneStored(item)
+		if err != nil {
+			return Links{}, err
+		}
+		item.file, item.raw = "", nil
 		if strings.EqualFold(item.Artifact.Target, guid) {
 			result.Incoming = append(result.Incoming, item)
 		}
@@ -1235,7 +1856,7 @@ func (r *Repository) Search(input SearchInput) ([]StoredArtifact, error) {
 	if input.Limit < 1 || input.Limit > 200 {
 		return nil, fail(400, "invalid_limit", "Limit must be 1-200.")
 	}
-	items, err := r.List(Filters{Kind: input.Kind, Type: input.Type})
+	items, err := r.filteredArtifacts(Filters{Kind: input.Kind, Type: input.Type})
 	if err != nil {
 		return nil, err
 	}
@@ -1243,6 +1864,11 @@ func (r *Repository) Search(input SearchInput) ([]StoredArtifact, error) {
 	for _, item := range items {
 		raw, _ := json.Marshal(item.Artifact)
 		if query == "" || strings.Contains(strings.ToLower(string(raw)), query) {
+			item, err = cloneStored(item)
+			if err != nil {
+				return nil, err
+			}
+			item.file, item.raw = "", nil
 			result = append(result, item)
 			if len(result) == input.Limit {
 				break
@@ -1254,7 +1880,7 @@ func (r *Repository) Search(input SearchInput) ([]StoredArtifact, error) {
 
 func (r *Repository) Tree() (map[string]any, error) {
 	root := map[string]any{"name": "", "folders": map[string]any{}, "artifacts": []any{}}
-	items, err := r.List(Filters{})
+	items, err := r.filteredArtifacts(Filters{})
 	if err != nil {
 		return nil, err
 	}
@@ -1277,7 +1903,7 @@ func (r *Repository) Tree() (map[string]any, error) {
 	return root, nil
 }
 
-func (r *Repository) readWorkflow(id, folder string) (workflow, error) {
+func readWorkflow(files map[string][]byte, id, folder string) (workflow, error) {
 	if err := validateIdentifier(id, "Workflow"); err != nil {
 		return workflow{}, err
 	}
@@ -1287,21 +1913,27 @@ func (r *Repository) readWorkflow(id, folder string) (workflow, error) {
 	}
 	for index := len(parts); index >= 0; index-- {
 		name := pathpkg.Join(pathpkg.Join(parts[:index]...), ".origoa", "workflows", id+".json")
-		raw, exists, err := r.headFile(context.Background(), name)
+		raw, exists := files[name]
 		if !exists {
 			continue
 		}
-		if err != nil {
-			return workflow{}, err
-		}
 		var value workflow
-		if json.Unmarshal(raw, &value) != nil || value.ID != id || !identifierPattern.MatchString(value.Initial) || !slices.Contains(value.States, value.Initial) {
+		if decodeStrict(raw, &value) != nil || value.ID != id || !identifierPattern.MatchString(value.Initial) || !slices.Contains(value.States, value.Initial) {
 			return workflow{}, fail(500, "repository_corrupt", "Invalid workflow "+name+".")
 		}
+		states := map[string]bool{}
+		for _, state := range value.States {
+			if !identifierPattern.MatchString(state) || states[state] {
+				return workflow{}, fail(500, "repository_corrupt", "Workflow contains an invalid state.")
+			}
+			states[state] = true
+		}
+		transitions := map[string]bool{}
 		for _, transition := range value.Transitions {
-			if !identifierPattern.MatchString(transition.ID) || !slices.Contains(value.States, transition.From) || !slices.Contains(value.States, transition.To) {
+			if !identifierPattern.MatchString(transition.ID) || transitions[transition.ID] || !states[transition.From] || !states[transition.To] {
 				return workflow{}, fail(500, "repository_corrupt", "Workflow contains an invalid transition.")
 			}
+			transitions[transition.ID] = true
 		}
 		return value, nil
 	}
@@ -1309,11 +1941,15 @@ func (r *Repository) readWorkflow(id, folder string) (workflow, error) {
 }
 
 func (r *Repository) Workflows(guid string) ([]WorkflowInfo, error) {
-	item, err := r.Get(guid)
+	snapshot, err := r.snapshot(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	schema, err := r.EffectiveSchema(item.Artifact.Type, item.Path)
+	item, err := r.get(guid, snapshot.artifacts)
+	if err != nil {
+		return nil, err
+	}
+	schema, err := effectiveSchema(snapshot.files, item.Artifact.Type, item.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -1325,7 +1961,7 @@ func (r *Repository) Workflows(guid string) ([]WorkflowInfo, error) {
 	sort.Strings(ordered)
 	result := make([]WorkflowInfo, 0, len(ordered))
 	for _, id := range ordered {
-		definition, err := r.readWorkflow(id, item.Path)
+		definition, err := readWorkflow(snapshot.files, id, item.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -1348,18 +1984,22 @@ func (r *Repository) Workflows(guid string) ([]WorkflowInfo, error) {
 }
 
 func (r *Repository) Transition(ctx context.Context, guid, workflowID, transitionID, expectedETag string) (StoredArtifact, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	unlock, err := r.lockWrite(ctx)
+	if err != nil {
+		return StoredArtifact{}, err
+	}
+	defer unlock()
 	if err := validateIdentifier(workflowID, "Workflow"); err != nil {
 		return StoredArtifact{}, err
 	}
 	if err := validateIdentifier(transitionID, "Transition"); err != nil {
 		return StoredArtifact{}, err
 	}
-	all, err := r.scan()
+	snapshot, err := r.snapshot(ctx)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
+	all := snapshot.artifacts
 	current, err := r.get(guid, all)
 	if err != nil {
 		return StoredArtifact{}, err
@@ -1367,14 +2007,14 @@ func (r *Repository) Transition(ctx context.Context, guid, workflowID, transitio
 	if current.ETag != expectedETag {
 		return StoredArtifact{}, fail(412, "version_conflict", "Artifact has changed; reload before saving.")
 	}
-	schema, err := r.EffectiveSchema(current.Artifact.Type, current.Path)
+	schema, err := effectiveSchema(snapshot.files, current.Artifact.Type, current.Path)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
 	if !configuredWorkflows(schema)[workflowID] {
 		return StoredArtifact{}, fail(409, "workflow_not_assigned", "Workflow is not assigned by the schema.")
 	}
-	definition, err := r.readWorkflow(workflowID, current.Path)
+	definition, err := readWorkflow(snapshot.files, workflowID, current.Path)
 	if err != nil {
 		return StoredArtifact{}, err
 	}
