@@ -1,19 +1,58 @@
 package core
 
 import (
+	"database/sql"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/thomdehoog/origoa/internal/ojson"
 )
 
-func testFoundation(t *testing.T) *Foundation {
-	t.Helper()
-	f, err := Open(t.TempDir() + "/repo.git")
+// pgTestDSN prepares a clean, package-private schema namespace and returns a
+// DSN scoped to it, or "" when ORIGOA_TEST_DSN is unset. The namespace keeps
+// concurrently tested packages from clobbering each other's tables.
+func pgTestDSN(t *testing.T) string {
+	base := os.Getenv("ORIGOA_TEST_DSN")
+	if base == "" {
+		return ""
+	}
+	db, err := sql.Open("postgres", base)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS origoa_core`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS origoa_core.artifacts, origoa_core.config_files, origoa_core.repo_state`); err != nil {
+		t.Fatal(err)
+	}
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	return base + sep + "search_path=origoa_core"
+}
+
+// openTest opens a Foundation with the PostgreSQL projection when
+// ORIGOA_TEST_DSN is set (resetting the namespace), else in-memory.
+func openTest(t *testing.T, gitDir string) (*Foundation, error) {
+	t.Helper()
+	if dsn := pgTestDSN(t); dsn != "" {
+		return OpenPostgres(gitDir, dsn)
+	}
+	return Open(gitDir)
+}
+
+func testFoundation(t *testing.T) *Foundation {
+	t.Helper()
+	f, err := openTest(t, t.TempDir()+"/repo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
 	return f
 }
 
@@ -210,7 +249,7 @@ func TestMoveKeepsIdentityAndLinks(t *testing.T) {
 
 func TestRebuildFromGitAlone(t *testing.T) {
 	dir := t.TempDir() + "/repo.git"
-	f, err := Open(dir)
+	f, err := openTest(t, dir)
 	must(t, err)
 	must(t, f.PutSchema("", "req", &Schema{ArtifactType: "requirement", HIDPrefix: "REQ"}))
 	m, err := f.CreateArtifact(KindEntry, "a/b", "requirement", body(t, `{"title":"persisted"}`))
@@ -218,9 +257,11 @@ func TestRebuildFromGitAlone(t *testing.T) {
 	c, err := f.CreateComment(m.GUID, "note", "", "tester")
 	must(t, err)
 
-	// A fresh Foundation over the same Git dir must project identical state.
-	f2, err := Open(dir)
+	// A fresh Foundation over the same Git dir must project identical state
+	// (with Postgres this exercises the full Sync rebuild after a reset).
+	f2, err := openTest(t, dir)
 	must(t, err)
+	defer f2.Close()
 	m2, err := f2.Meta(m.GUID)
 	must(t, err)
 	if m2.Title != "persisted" || m2.HID != m.HID || m2.Folder != "a/b" {

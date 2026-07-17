@@ -2,10 +2,12 @@ package httpapi
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -19,10 +21,35 @@ type client struct {
 
 func newClient(t *testing.T) *client {
 	t.Helper()
-	f, err := core.Open(t.TempDir() + "/repo.git")
+	gitDir := t.TempDir() + "/repo.git"
+	var f *core.Foundation
+	var err error
+	if base := os.Getenv("ORIGOA_TEST_DSN"); base != "" {
+		// Package-private schema namespace: keeps concurrently tested
+		// packages from clobbering each other's tables.
+		db, derr := sql.Open("postgres", base)
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		if _, derr := db.Exec(`CREATE SCHEMA IF NOT EXISTS origoa_api`); derr != nil {
+			t.Fatal(derr)
+		}
+		if _, derr := db.Exec(`DROP TABLE IF EXISTS origoa_api.artifacts, origoa_api.config_files, origoa_api.repo_state`); derr != nil {
+			t.Fatal(derr)
+		}
+		db.Close()
+		sep := "?"
+		if strings.Contains(base, "?") {
+			sep = "&"
+		}
+		f, err = core.OpenPostgres(gitDir, base+sep+"search_path=origoa_api")
+	} else {
+		f, err = core.Open(gitDir)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { f.Close() })
 	srv := httptest.NewServer(New(f))
 	t.Cleanup(srv.Close)
 	return &client{t: t, srv: srv}
@@ -238,6 +265,7 @@ func TestAdversarial(t *testing.T) {
 	})
 
 	t.Run("schema-constrained link types enforced", func(t *testing.T) {
+		c := &client{t: t, srv: c.srv} // rebind failures to this subtest
 		c.must("PUT", "/api/schemas/strict", map[string]any{
 			"artifactType": "strict",
 			"relationships": []map[string]any{{"linkType": "only", "targetTypes": []string{"strict"}}},
@@ -252,6 +280,7 @@ func TestAdversarial(t *testing.T) {
 	})
 
 	t.Run("comment on ghost or foreign parent rejected", func(t *testing.T) {
+		c := &client{t: t, srv: c.srv} // rebind failures to this subtest
 		if status, _ := c.do("POST", "/api/comments", map[string]any{"subject": core.NewGUID(), "text": "x"}, nil); status != 400 {
 			t.Fatal("comment on ghost accepted")
 		}

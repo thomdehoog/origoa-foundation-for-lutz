@@ -16,9 +16,16 @@ func main() {
 	repo := flag.String("repo", "origoa.git", "path to the bare Git repository (created if missing)")
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	web := flag.String("web", "", "directory with the built frontend (optional)")
+	db := flag.String("db", "", "PostgreSQL DSN for the projection database (default: in-memory)")
 	flag.Parse()
 
-	f, err := core.Open(*repo)
+	var f *core.Foundation
+	var err error
+	if *db != "" {
+		f, err = core.OpenPostgres(*repo, *db)
+	} else {
+		f, err = core.Open(*repo)
+	}
 	if err != nil {
 		log.Fatalf("open repository: %v", err)
 	}

@@ -46,8 +46,16 @@ make run             # serves http://127.0.0.1:8080 with repo in data/origoa.git
 ./examples/seed.sh   # populate a demo requirements domain
 ```
 
+With PostgreSQL (plain SQL, no ORM — tables are auto-created):
+
+```sh
+./bin/origoad -repo data/origoa.git -web web/dist \
+  -db "postgres://user:pass@localhost:5432/origoa?sslmode=disable"
+```
+
 `make test` runs `go vet` and the full test suite (including adversarial
-tests) with the race detector.
+tests) with the race detector against the in-memory projection. Set
+`ORIGOA_TEST_DSN` to run the same suite against PostgreSQL — CI runs both.
 
 ## REST API
 
@@ -81,10 +89,21 @@ concurrent-edit conflict).
 web/            Lit + TypeScript SPA (schema-driven, no framework)
 cmd/origoad     server entry point
 internal/httpapi  REST layer
-internal/core     Foundation: artifacts, schemas, workflows, projection
+internal/core     Foundation: artifacts, schemas, workflows, projections
 internal/gitx     bare-repo Git plumbing (CAS commits, batch reads)
 internal/ojson    order-preserving JSON (stable repository serialization)
 ```
+
+The query layer is a `Projection` with two implementations, selected by the
+`-db` flag:
+
+- **In-memory** (default): zero dependencies, rebuilt from Git HEAD on start
+  and after every write. Ideal for development, tests, and small repos.
+- **PostgreSQL** (per the design guide): plain SQL, `processed_hash`
+  revision tracking, folder-prefix and GIN full-text indexes. Each commit is
+  projected in one transaction; on startup, a matching `processed_hash`
+  reuses the stored projection, any divergence (crash, foreign push)
+  triggers a full rebuild from Git.
 
 The repository is a **bare Git repo**; you can clone it, edit files by hand
 and push — the projection tolerates malformed files and can always be
@@ -94,14 +113,12 @@ rebuilt (`POST /api/admin/reindex`).
 
 Documented so they are decisions, not accidents:
 
-- **Projection is in-memory, not PostgreSQL.** The design requires the
-  database to be a disposable projection of Git; at MVP scale the leanest
-  correct projection is memory, rebuilt from HEAD on start and after every
-  write (which also guarantees it can never drift). The `core` API is the
-  seam where a PostgreSQL projection slots in when repository size demands
-  it — nothing above `internal/core` would change.
-- **Full rebuild per write** instead of incremental projection updates.
-  Correct by construction; optimize only when profiling says so.
+- **Recovery jumps straight to a full rebuild.** The design prefers
+  replaying missing commits sequentially and reserves full rebuild for when
+  replay can't continue (§5.14). Rebuild is the safe superset and MVP repos
+  are small; sequential replay is an optimization for later.
+- **The in-memory projection applies writes by full rebuild** — correct by
+  construction; the PostgreSQL projection is the incremental path.
 - **Cardinality is stored but not enforced** — the design assigns
   validation and automation to the application layer. Link *type/target
   allowlists* are enforced because the design names them as constraints.

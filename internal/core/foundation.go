@@ -3,11 +3,8 @@ package core
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"path"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,60 +15,100 @@ import (
 
 // Foundation exposes all repository operations. Git is the single source of
 // truth; every write produces exactly one commit describing the logical
-// operation, after which the projection is rebuilt from HEAD ("never trust
-// metadata when the primary data already exists").
+// operation, which is then projected into the derived query layer. If the
+// projection ever diverges from Git (crash, direct push), it is rebuilt from
+// HEAD — "never trust metadata when the primary data already exists".
 type Foundation struct {
-	git *gitx.Repo
-	ix  *index
-	wmu sync.Mutex // serializes writers
+	git  *gitx.Repo
+	proj Projection
+	wmu  sync.Mutex // serializes writers
 }
 
 var typeRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 
-// Open initializes (if needed) the bare repository at gitDir and builds the
-// projection.
+// Open initializes (if needed) the bare repository at gitDir with the
+// in-memory projection.
 func Open(gitDir string) (*Foundation, error) {
 	g, err := gitx.Init(gitDir)
 	if err != nil {
 		return nil, err
 	}
-	f := &Foundation{git: g, ix: newIndex()}
-	if err := f.Reindex(); err != nil {
+	return open(g, newMemProjection(g))
+}
+
+// OpenPostgres initializes the repository with the PostgreSQL projection.
+// When the stored processed_hash already matches the Git HEAD the projection
+// is reused as-is; otherwise it is rebuilt from Git.
+func OpenPostgres(gitDir, dsn string) (*Foundation, error) {
+	g, err := gitx.Init(gitDir)
+	if err != nil {
 		return nil, err
+	}
+	proj, err := newPGProjection(g, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return open(g, proj)
+}
+
+func open(g *gitx.Repo, proj Projection) (*Foundation, error) {
+	f := &Foundation{git: g, proj: proj}
+	head, err := g.Head()
+	if err != nil {
+		return nil, err
+	}
+	if head != proj.Head() {
+		if err := proj.Sync(); err != nil {
+			proj.Close()
+			return nil, err
+		}
 	}
 	return f, nil
 }
 
 // Reindex rebuilds all derived state from the Git HEAD.
-func (f *Foundation) Reindex() error { return f.ix.rebuild(f.git) }
+func (f *Foundation) Reindex() error { return f.proj.Sync() }
 
 // Head returns the Git revision the projection represents.
-func (f *Foundation) Head() string {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	return f.ix.head
-}
+func (f *Foundation) Head() string { return f.proj.Head() }
 
-// commit publishes ops and synchronizes the projection.
+func (f *Foundation) Close() error { return f.proj.Close() }
+
+// commit publishes ops as one Git commit and projects the changes. Callers
+// hold f.wmu.
 func (f *Foundation) commit(msg string, ops []gitx.Op) error {
-	if _, err := f.git.Commit(msg, ops); err != nil {
+	// Repair divergence caused by crashes or direct Git pushes before
+	// building on top of it.
+	if head, err := f.git.Head(); err != nil {
+		return err
+	} else if head != f.proj.Head() {
+		if err := f.proj.Sync(); err != nil {
+			return err
+		}
+	}
+	newHead, err := f.git.Commit(msg, ops)
+	if err != nil {
 		return err
 	}
-	return f.ix.rebuild(f.git)
+	changes := make([]Change, len(ops))
+	for i, op := range ops {
+		changes[i] = Change{Path: op.Path, Delete: op.Delete}
+		if !op.Delete {
+			changes[i].SHA = gitx.BlobSHA(op.Content)
+			changes[i].Content = op.Content
+		}
+	}
+	return f.proj.Apply(newHead, changes)
 }
 
 // ---- reads ----
 
 func (f *Foundation) Meta(guid string) (*Meta, error) {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	m, ok := f.ix.byGUID[guid]
+	m, ok := f.proj.Get(guid)
 	if !ok {
 		return nil, fmt.Errorf("%w: artifact %s", ErrNotFound, guid)
 	}
-	cp := *m
-	cp.Workflows = maps.Clone(m.Workflows) // callers may mutate; never alias the projection
-	return &cp, nil
+	return m, nil
 }
 
 // Artifact returns the projected meta and the full stored object.
@@ -94,85 +131,40 @@ func (f *Foundation) Artifact(guid string) (*Meta, *ojson.Obj, error) {
 // List returns artifact metas filtered by kind, type and folder. With
 // subtree, artifacts in nested folders are included.
 func (f *Foundation) List(kind, typ, folder string, subtree bool) []*Meta {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	return f.ix.sortedMetas(func(m *Meta) bool {
-		if kind != "" && m.Kind != kind {
-			return false
-		}
-		if typ != "" && m.Type != typ {
-			return false
-		}
-		if folder != "" || !subtree {
-			if subtree {
-				if m.Folder != folder && !strings.HasPrefix(m.Folder, folder+"/") {
-					return false
-				}
-			} else if m.Folder != folder {
-				return false
-			}
-		}
-		return true
-	})
+	return f.proj.List(ListQuery{Kind: kind, Type: typ, Folder: folder, Subtree: subtree})
 }
 
-func (f *Foundation) Folders() []string {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	out := make([]string, 0, len(f.ix.folders))
-	for folder := range f.ix.folders {
-		out = append(out, folder)
-	}
-	sort.Strings(out)
-	return out
-}
+func (f *Foundation) Folders() []string { return f.proj.Folders() }
 
 func (f *Foundation) Search(q, kind, typ string) []*Meta {
-	q = strings.ToLower(strings.TrimSpace(q))
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	return f.ix.sortedMetas(func(m *Meta) bool {
-		if kind != "" && m.Kind != kind {
-			return false
-		}
-		if typ != "" && m.Type != typ {
-			return false
-		}
-		return q == "" || strings.Contains(f.ix.text[m.GUID], q)
-	})
+	return f.proj.List(ListQuery{Kind: kind, Type: typ, Subtree: true, Text: q})
 }
 
 func (f *Foundation) EffectiveSchema(typ, folder string) (*Schema, error) {
-	if folder != "" {
-		var err error
-		if folder, err = CleanFolder(folder); err != nil {
-			return nil, err
-		}
+	folder, err := CleanFolder(folder)
+	if err != nil {
+		return nil, err
 	}
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	s := f.ix.effectiveSchema(typ, folder)
+	s := f.effSchema(typ, folder)
 	if s == nil {
 		return nil, fmt.Errorf("%w: no schema for type %q", ErrNotFound, typ)
 	}
 	return s, nil
 }
 
-// Schemas returns all schema definitions grouped by configuration scope.
-func (f *Foundation) Schemas() map[string][]*Schema {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	out := map[string][]*Schema{}
-	for scope, defs := range f.ix.schemas {
-		out[scope] = append([]*Schema(nil), defs...)
+func (f *Foundation) effSchema(typ, folder string) *Schema {
+	defs := f.proj.SchemaDefs(typ, scopeChain(folder))
+	if len(defs) == 0 {
+		return nil
 	}
-	return out
+	return composeSchemas(defs)
 }
 
+// Schemas returns all schema definitions grouped by configuration scope.
+func (f *Foundation) Schemas() map[string][]*Schema { return f.proj.SchemasByScope() }
+
 func (f *Foundation) WorkflowDef(id, folder string) (*Workflow, error) {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	w := f.ix.resolveWorkflow(id, folder)
+	w := f.proj.Workflow(id, scopeChain(folder))
 	if w == nil {
 		return nil, fmt.Errorf("%w: workflow %q", ErrNotFound, id)
 	}
@@ -215,27 +207,11 @@ func (f *Foundation) ResolveOverlay(guid string) (fields map[string]json.RawMess
 
 // Links returns incoming and outgoing links of an artifact.
 func (f *Foundation) Links(guid string) (incoming, outgoing []*Meta) {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	for _, m := range f.ix.sortedMetas(func(m *Meta) bool { return m.Kind == KindLink }) {
-		if m.Target == guid {
-			incoming = append(incoming, m)
-		}
-		if m.Source == guid {
-			outgoing = append(outgoing, m)
-		}
-	}
-	return
+	return f.proj.LinksFor(guid)
 }
 
 // Comments returns all comments whose subject is guid.
-func (f *Foundation) Comments(guid string) []*Meta {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	return f.ix.sortedMetas(func(m *Meta) bool {
-		return m.Kind == KindComment && m.Subject == guid
-	})
-}
+func (f *Foundation) Comments(guid string) []*Meta { return f.proj.CommentsFor(guid) }
 
 // History returns the commit log touching an artifact.
 func (f *Foundation) History(guid string, limit int) ([]gitx.LogEntry, error) {
@@ -274,15 +250,11 @@ func (f *Foundation) CreateArtifact(kind, folder, typ string, body *ojson.Obj) (
 	obj.SetString("kind", kind)
 	obj.SetString("type", typ)
 
-	schema := func() *Schema {
-		f.ix.mu.RLock()
-		defer f.ix.mu.RUnlock()
-		return f.ix.effectiveSchema(typ, folder)
-	}()
+	schema := f.effSchema(typ, folder)
 
 	hid := strings.TrimSpace(body.GetString("hid"))
 	if hid == "" && schema != nil && schema.HIDPrefix != "" {
-		hid = f.nextHID(schema.HIDPrefix)
+		hid = fmt.Sprintf("%s-%d", schema.HIDPrefix, f.proj.MaxHIDNumber(schema.HIDPrefix)+1)
 	}
 	if hid != "" {
 		if err := f.checkHID(hid, guid); err != nil {
@@ -305,7 +277,7 @@ func (f *Foundation) CreateArtifact(kind, folder, typ string, body *ojson.Obj) (
 	if schema != nil && len(schema.Workflows) > 0 {
 		states := map[string]string{}
 		for _, wfID := range schema.Workflows {
-			if wf := f.resolveWorkflowLocked(wfID, folder); wf != nil {
+			if wf := f.proj.Workflow(wfID, scopeChain(folder)); wf != nil {
 				states[wfID] = wf.Initial
 			}
 		}
@@ -476,7 +448,7 @@ func (f *Foundation) CreateLink(typ, source, target string, fields json.RawMessa
 		return nil, vErr("target artifact %s not found", target)
 	}
 	// Schema relationship definitions constrain links when present.
-	if schema := f.effectiveSchemaLocked(src.Type, src.Folder); schema != nil && len(schema.Relationships) > 0 {
+	if schema := f.effSchema(src.Type, src.Folder); schema != nil && len(schema.Relationships) > 0 {
 		var rel *Relationship
 		for i := range schema.Relationships {
 			if schema.Relationships[i].LinkType == typ {
@@ -576,11 +548,11 @@ func (f *Foundation) Transition(guid, workflowID, to string) (*Meta, error) {
 	if m.Kind != KindEntry && m.Kind != KindDocument {
 		return nil, vErr("artifact kind %q has no workflows", m.Kind)
 	}
-	schema := f.effectiveSchemaLocked(m.Type, m.Folder)
+	schema := f.effSchema(m.Type, m.Folder)
 	if schema == nil || !contains(schema.Workflows, workflowID) {
 		return nil, vErr("workflow %q is not assigned to type %q", workflowID, m.Type)
 	}
-	wf := f.resolveWorkflowLocked(workflowID, m.Folder)
+	wf := f.proj.Workflow(workflowID, scopeChain(m.Folder))
 	if wf == nil {
 		return nil, vErr("workflow definition %q not found", workflowID)
 	}
@@ -655,7 +627,11 @@ func (f *Foundation) artifactOps(m *Meta, del bool, moveTo string) ([]gitx.Op, e
 		return []gitx.Op{{Path: m.FilePath, Delete: true}}, nil
 	}
 	dir := path.Dir(m.FilePath)
-	entries, err := f.git.ListTree(f.Head(), dir+"/")
+	head, err := f.git.Head()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := f.git.ListTree(head, dir+"/")
 	if err != nil {
 		return nil, err
 	}
@@ -686,9 +662,7 @@ func (f *Foundation) checkHID(hid, guid string) error {
 	if len(hid) > 100 || strings.ContainsAny(hid, " \t\n") {
 		return vErr("invalid HID %q", hid)
 	}
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	if owner, ok := f.ix.byHID[hid]; ok && owner != guid {
+	if owner, ok := f.proj.HIDOwner(hid); ok && owner != guid {
 		return fmt.Errorf("%w: HID %q is already assigned to %s", ErrConflict, hid, owner)
 	}
 	return nil
@@ -713,32 +687,6 @@ func (f *Foundation) checkBase(base, guid string) error {
 		base = m.Base
 	}
 	return nil
-}
-
-func (f *Foundation) nextHID(prefix string) string {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	max := 0
-	for hid := range f.ix.byHID {
-		if rest, ok := strings.CutPrefix(hid, prefix+"-"); ok {
-			if n, err := strconv.Atoi(rest); err == nil && n > max {
-				max = n
-			}
-		}
-	}
-	return fmt.Sprintf("%s-%d", prefix, max+1)
-}
-
-func (f *Foundation) effectiveSchemaLocked(typ, folder string) *Schema {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	return f.ix.effectiveSchema(typ, folder)
-}
-
-func (f *Foundation) resolveWorkflowLocked(id, folder string) *Workflow {
-	f.ix.mu.RLock()
-	defer f.ix.mu.RUnlock()
-	return f.ix.resolveWorkflow(id, folder)
 }
 
 func requireObject(raw json.RawMessage, name string) error {
