@@ -5,14 +5,12 @@
 **A Git-backed storage platform for building information management applications** —
 requirements management, issue tracking, PLM, documentation, and anything in between.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/thomdehoog/origoa-foundation-for-lutz/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/thomdehoog/origoa-foundation-for-lutz/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?style=for-the-badge&logo=go&logoColor=white)](go.mod)
-[![Frontend](https://img.shields.io/badge/Lit%20%2B%20TypeScript-324FFF?style=for-the-badge&logo=lit&logoColor=white&label=Frontend)](web/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-ready-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)](docs/INSTALL.md)
-
-[![Source of truth](https://img.shields.io/badge/Source%20of%20truth-Git-F05032?style=for-the-badge&logo=git&logoColor=white)](#the-core-idea)
-[![Tests](https://img.shields.io/badge/Tests-race%20detector%20%2B%20fuzzing%20%2B%20e2e-2EA44F?style=for-the-badge&logo=checkmarx&logoColor=white)](#testing)
-[![REST API](https://img.shields.io/badge/API-REST%20%2B%20ETag%2FIf--Match-FF6F00?style=for-the-badge&logo=swagger&logoColor=white)](#rest-api)
+[![CI](https://github.com/thomdehoog/origoa-foundation-for-lutz/actions/workflows/ci.yml/badge.svg)](https://github.com/thomdehoog/origoa-foundation-for-lutz/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Frontend](https://img.shields.io/badge/Frontend-Lit%20%2B%20TypeScript-324FFF?logo=lit&logoColor=white)](web/)
+[![PostgreSQL](https://img.shields.io/badge/Projection-PostgreSQL%20%7C%20in--memory-4169E1?logo=postgresql&logoColor=white)](docs/INSTALL.md)
+[![Source of truth](https://img.shields.io/badge/Source%20of%20truth-Git-F05032?logo=git&logoColor=white)](#the-core-idea)
+[![Tests](https://img.shields.io/badge/Tests-race%20%2B%20fuzz%20%2B%20e2e-2EA44F?logo=checkmarx&logoColor=white)](#testing)
 
 <img src="docs/screenshot.png" alt="Origoa web interface: folder navigation, artifact table with HIDs and workflow states, and a schema-driven detail editor" width="900">
 
