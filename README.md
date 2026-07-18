@@ -10,7 +10,6 @@ requirements management, issue tracking, PLM, documentation, and anything in bet
 [![Frontend](https://img.shields.io/badge/Frontend-Lit%20%2B%20TypeScript-324FFF?logo=lit&logoColor=white)](web/)
 [![PostgreSQL](https://img.shields.io/badge/Projection-PostgreSQL%20%7C%20in--memory-4169E1?logo=postgresql&logoColor=white)](docs/INSTALL.md)
 [![Source of truth](https://img.shields.io/badge/Source%20of%20truth-Git-F05032?logo=git&logoColor=white)](#the-core-idea)
-[![Tests](https://img.shields.io/badge/Tests-race%20%2B%20fuzz%20%2B%20e2e-2EA44F?logo=checkmarx&logoColor=white)](#testing)
 
 <img src="docs/screenshot.png" alt="Origoa web interface: folder navigation, artifact table with HIDs and workflow states, and a schema-driven detail editor" width="900">
 
